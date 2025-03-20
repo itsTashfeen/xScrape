@@ -37,28 +37,54 @@ class DatabaseManager:
         self.quote_tweets.create_index([('tweet_id', ASCENDING)])
 
     def save_tweets(self, tweets: List[Dict], username: str) -> None:
-        for tweet in tweets:
-            tweet_doc = {
-                'tweet_id': tweet.get('id'),
-                'author': {'username': username},
-                'content': tweet.get('text', ''),
-                'metrics': {
-                    'likes': int(tweet.get('likes', 0)),
-                    'retweets': int(tweet.get('retweets', 0)),
-                    'replies': int(tweet.get('replies', 0))
-                },
-                'is_thread': tweet.get('is_thread', False),
-                'thread_tweets': tweet.get('thread_tweets', []),
-                'comments': tweet.get('comments', []),
-                'media': tweet.get('media', []),
-                'scraped_at': datetime.now()
-            }
+        """Save multiple tweets to the database"""
+        if not tweets:
+            logging.warning(f"No tweets to save for user {username}")
+            return
             
-            self.tweets.update_one(
-                {'tweet_id': tweet_doc['tweet_id']},
-                {'$set': tweet_doc},
-                upsert=True
-            )
+        logging.info(f"Saving {len(tweets)} tweets for user {username}")
+        
+        for tweet in tweets:
+            try:
+                tweet_id = tweet.get('id')
+                if not tweet_id:
+                    logging.warning("Skipping tweet with no ID")
+                    continue
+                    
+                tweet_doc = {
+                    'tweet_id': tweet_id,
+                    'author': {'username': username},
+                    'content': tweet.get('text', ''),
+                    'metrics': {
+                        'likes': int(tweet.get('likes', 0)),
+                        'retweets': int(tweet.get('retweets', 0)),
+                        'replies': int(tweet.get('replies', 0))
+                    },
+                    'is_thread': tweet.get('is_thread', False),
+                    'thread_tweets': tweet.get('thread_tweets', []),
+                    'comments': tweet.get('comments', []),
+                    'media': tweet.get('media', []),
+                    'scraped_at': datetime.now()
+                }
+                
+                result = self.tweets.update_one(
+                    {'tweet_id': tweet_id},
+                    {'$set': tweet_doc},
+                    upsert=True
+                )
+                
+                if result.upserted_id:
+                    logging.info(f"Inserted new tweet {tweet_id}")
+                elif result.modified_count:
+                    logging.info(f"Updated existing tweet {tweet_id}")
+                else:
+                    logging.info(f"Tweet {tweet_id} already exists")
+                    
+            except Exception as e:
+                logging.error(f"Error saving tweet {tweet_id}: {str(e)}")
+                continue
+                
+        logging.info(f"Finished saving tweets for user {username}")
 
     def get_tweets_by_username(self, username: str, limit: int = 100):
         """Retrieve tweets for a specific username"""

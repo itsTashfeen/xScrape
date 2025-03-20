@@ -49,17 +49,124 @@ class TwitterScraper:
         page.mouse.wheel(0, scroll_distance)
         self.random_delay(1.0, 2.0)  # Random pause after scrolling
 
-    def extract_tweet_data(self, tweet_element) -> Optional[Dict]:
+    def extract_tweet_data(self, tweet_element, context=None) -> Optional[Dict]:
         try:
-            text_element = tweet_element.query_selector('[data-testid="tweetText"]')
+            # Get tweet ID and URL
+            tweet_url = None
+            tweet_link = tweet_element.query_selector('a[href*="/status/"]')
+            if tweet_link:
+                tweet_url = tweet_link.get_attribute('href')
+                tweet_id = tweet_url.split('/status/')[1]
+            else:
+                tweet_id = (
+                    tweet_element.get_attribute('data-tweet-id') or
+                    tweet_element.get_attribute('data-item-id')
+                )
+            
+            if not tweet_id:
+                logging.warning("Could not extract tweet ID")
+                return None
+                
+            # Get full tweet content by visiting the tweet URL
+            full_content = None
+            if tweet_url and context:
+                try:
+                    tweet_page = context.new_page()
+                    tweet_page.goto(f"https://twitter.com{tweet_url}")
+                    self.random_delay(2, 3)
+                    
+                    # Try to expand the tweet content
+                    try:
+                        show_more = tweet_page.query_selector('[data-testid="tweet-text-show-more-link"]')
+                        if show_more:
+                            show_more.click()
+                            time.sleep(1)
+                    except:
+                        pass
+                    
+                    # Get the full tweet text
+                    text_element = tweet_page.query_selector('[data-testid="tweetText"]')
+                    if text_element:
+                        full_content = text_element.evaluate('''(element) => {
+                            const walk = document.createTreeWalker(
+                                element,
+                                NodeFilter.SHOW_TEXT | NodeFilter.SHOW_ELEMENT,
+                                null,
+                                false
+                            );
+                            
+                            let text = '';
+                            let node;
+                            
+                            while (node = walk.nextNode()) {
+                                if (node.nodeType === Node.TEXT_NODE) {
+                                    text += node.textContent;
+                                } else if (node.tagName === 'BR') {
+                                    text += '\\n';
+                                } else if (node.nodeType === Node.ELEMENT_NODE) {
+                                    const style = window.getComputedStyle(node);
+                                    if (style.display === 'block') {
+                                        text += '\\n';
+                                    }
+                                    if (node.textContent) {
+                                        text += node.textContent;
+                                    }
+                                }
+                            }
+                            
+                            return text;
+                        }''')
+                    
+                    tweet_page.close()
+                except Exception as e:
+                    logging.error(f"Error getting full tweet content: {str(e)}")
+            
+            # If we couldn't get the full content, fall back to the preview content
+            if not full_content:
+                text_element = tweet_element.query_selector('[data-testid="tweetText"]')
+                if text_element:
+                    full_content = text_element.evaluate('''(element) => {
+                        const walk = document.createTreeWalker(
+                            element,
+                            NodeFilter.SHOW_TEXT | NodeFilter.SHOW_ELEMENT,
+                            null,
+                            false
+                        );
+                        
+                        let text = '';
+                        let node;
+                        
+                        while (node = walk.nextNode()) {
+                            if (node.nodeType === Node.TEXT_NODE) {
+                                text += node.textContent;
+                            } else if (node.tagName === 'BR') {
+                                text += '\\n';
+                            } else if (node.nodeType === Node.ELEMENT_NODE) {
+                                const style = window.getComputedStyle(node);
+                                if (style.display === 'block') {
+                                    text += '\\n';
+                                }
+                                if (node.textContent) {
+                                    text += node.textContent;
+                                }
+                            }
+                        }
+                        
+                        return text;
+                    }''')
+            
+            if not full_content:
+                return None
+                
             return {
-                'id': tweet_element.get_attribute('data-tweet-id'),
-                'text': text_element.inner_text() if text_element else '',
+                'id': tweet_id,
+                'text': full_content.strip(),
                 'likes': self._get_metric(tweet_element, 'like'),
                 'retweets': self._get_metric(tweet_element, 'retweet'),
                 'replies': self._get_metric(tweet_element, 'reply')
             }
-        except Exception:
+        except Exception as e:
+            logging.error(f"Error extracting tweet data: {str(e)}")
             return None
 
     def _extract_media(self, tweet_element) -> List[Dict]:
@@ -104,25 +211,35 @@ class TwitterScraper:
                 page = context.new_page()
                 
                 # Go to profile page
+                logging.info(f"Navigating to https://twitter.com/{username}")
                 page.goto(f"https://twitter.com/{username}")
                 
-                # Wait for any of these elements to appear
+                # Wait for page to load and check its state
                 try:
-                    # Wait for either the timeline or a message indicating private account
-                    page.wait_for_selector('[data-testid="primaryColumn"], [data-testid="emptyState"]', timeout=10000)
+                    # Wait for any of these elements to appear
+                    page.wait_for_selector('[data-testid="primaryColumn"], [data-testid="emptyState"], [data-testid="error"]', timeout=15000)
                     
-                    # Check if account is private
-                    private_account = page.query_selector('[data-testid="emptyState"]')
-                    if private_account:
+                    # Check for various page states
+                    if page.query_selector('[data-testid="emptyState"]'):
                         logging.warning(f"Account @{username} appears to be private")
                         return []
                     
-                    # Check for rate limiting or other error states
-                    error_message = page.query_selector('text="Something went wrong"')
-                    if error_message:
+                    if page.query_selector('[data-testid="error"]'):
                         logging.error("Twitter returned an error page")
                         return []
-                        
+                    
+                    # Check if we're on the login page
+                    if page.query_selector('text="Log in to Twitter"'):
+                        logging.error("Twitter is requesting login")
+                        return []
+                    
+                    # Check for rate limiting
+                    if page.query_selector('text="Rate limit exceeded"'):
+                        logging.error("Twitter rate limit exceeded")
+                        return []
+                    
+                    logging.info("Page loaded successfully")
+                    
                 except Exception as e:
                     logging.error(f"Error waiting for page elements: {str(e)}")
                     return []
@@ -135,30 +252,41 @@ class TwitterScraper:
                 
                 while len(tweets) < tweet_limit and scroll_attempts < max_scroll_attempts:
                     try:
-                        # Get all tweets currently visible
-                        tweet_elements = page.query_selector_all('article[data-testid="tweet"]')
+                        # Try different selectors for tweets
+                        tweet_elements = page.query_selector_all('article[data-testid="tweet"], div[data-testid="tweet"]')
                         current_tweets_count = len(tweet_elements)
+                        
+                        logging.info(f"Found {current_tweets_count} tweets on page")
                         
                         # If we're not getting new tweets after scrolling, increment attempts
                         if current_tweets_count == last_tweets_count:
                             scroll_attempts += 1
+                            logging.info(f"No new tweets found after scroll. Attempt {scroll_attempts}/{max_scroll_attempts}")
                         else:
                             scroll_attempts = 0
                             last_tweets_count = current_tweets_count
                         
                         for tweet in tweet_elements:
-                            tweet_id = tweet.get_attribute('data-tweet-id')
-                            if not tweet_id or tweet_id in tweets_seen:
-                                continue
-                                
-                            tweets_seen.add(tweet_id)
-                            
                             try:
-                                tweet_data = self.extract_tweet_data(tweet)
+                                # Try different ways to get the tweet ID
+                                tweet_id = (
+                                    tweet.get_attribute('data-tweet-id') or
+                                    tweet.get_attribute('data-item-id') or
+                                    tweet.query_selector('a[href*="/status/"]').get_attribute('href').split('/status/')[1]
+                                )
+                                
+                                if not tweet_id or tweet_id in tweets_seen:
+                                    continue
+                                    
+                                tweets_seen.add(tweet_id)
+                                logging.info(f"Processing tweet {tweet_id}")
+                                
+                                tweet_data = self.extract_tweet_data(tweet, context)
                                 if tweet_data:
                                     # Check if it's part of a thread
                                     thread_indicator = tweet.query_selector('[data-testid="conversationThread"]')
                                     if thread_indicator:
+                                        logging.info(f"Tweet {tweet_id} is part of a thread")
                                         thread_tweets = self.scrape_thread(tweet_id, context)
                                         tweet_data['is_thread'] = True
                                         tweet_data['thread_tweets'] = thread_tweets
@@ -173,29 +301,32 @@ class TwitterScraper:
                                     tweet_data['media'] = self._extract_media(tweet)
                                     
                                     tweets.append(tweet_data)
-                                    logging.info(f"Scraped tweet {len(tweets)}/{tweet_limit}")
+                                    logging.info(f"Successfully scraped tweet {len(tweets)}/{tweet_limit}")
                                     
                                     if len(tweets) >= tweet_limit:
                                         break
                             except Exception as e:
-                                logging.error(f"Error processing tweet {tweet_id}: {str(e)}")
+                                logging.error(f"Error processing tweet: {str(e)}")
                                 continue
                         
                         if len(tweets) < tweet_limit:
                             # Scroll and wait for new content
                             if self._scroll_down(page):
+                                logging.info("Successfully scrolled down")
                                 page.wait_for_timeout(2000)  # Wait for new tweets to load
                             else:
                                 scroll_attempts += 1
+                                logging.info(f"Failed to scroll down. Attempt {scroll_attempts}/{max_scroll_attempts}")
                                 
                             # Try to click "Show more tweets" if present
                             try:
                                 show_more = page.query_selector('span:has-text("Show more")')
                                 if show_more:
                                     show_more.click()
+                                    logging.info("Clicked 'Show more' button")
                                     self.random_delay(2, 3)
-                            except:
-                                pass
+                            except Exception as e:
+                                logging.debug(f"No 'Show more' button found: {str(e)}")
                                 
                     except Exception as e:
                         logging.error(f"Error during tweet collection: {str(e)}")
