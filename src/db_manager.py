@@ -1,99 +1,61 @@
 from pymongo import MongoClient, ASCENDING
-from pymongo.errors import ServerSelectionTimeoutError, PyMongoError
-import sys
+from pymongo.errors import PyMongoError
+import os
 import logging
 from datetime import datetime
 from typing import List, Dict
-import os
+from dotenv import load_dotenv
 
 class DatabaseManager:
     def __init__(self):
+        load_dotenv()
         try:
-            # Load environment variables
-            self.client = MongoClient(os.getenv('MONGODB_URI'), serverSelectionTimeoutMS=5000)
-            # Test the connection
+            self.client = MongoClient(os.getenv('MONGODB_URI'))
             self.client.admin.command('ping')
-            
             self.db = self.client['twitter_scraper']
-            
-            # Initialize collections
             self.tweets = self.db['tweets']
             self.profiles = self.db['profiles']
             self.threads = self.db['threads']
             self.comments = self.db['comments']
             self.media = self.db['media']
             self.quote_tweets = self.db['quote_tweets']
-            
-            # Create indexes for better query performance
             self.setup_indexes()
-            
             logging.info("Successfully connected to MongoDB")
-            
         except PyMongoError as e:
             logging.error(f"MongoDB Error: {str(e)}")
-            print("\nERROR: Could not connect to MongoDB. Please check your connection string and network connection.")
-            sys.exit(1)
-    
+            raise
+
     def setup_indexes(self):
-        # Create indexes if they don't exist
-        self.tweets.create_index([('tweet_id', ASCENDING)], unique=True)
-        except ConnectionError:
-            logging.error("Could not connect to MongoDB. Is it running?")
-            print("\nERROR: Could not connect to MongoDB. Please make sure MongoDB is running:")
-            print("Windows: Check if MongoDB service is running in Services")
-            print("Mac: Run 'brew services start mongodb-community'")
-            print("Linux: Run 'sudo systemctl start mongod'")
-            sys.exit(1)
-            
-        except ServerSelectionTimeoutError:
-            logging.error("MongoDB server selection timeout. Is MongoDB running?")
-            print("\nERROR: MongoDB server selection timeout. Please make sure MongoDB is running.")
-            sys.exit(1)
-    
-    def setup_indexes(self):
-        # Indexes for tweets collection
         self.tweets.create_index([('tweet_id', ASCENDING)], unique=True)
         self.tweets.create_index([('author.username', ASCENDING)])
         self.tweets.create_index([('timestamp', ASCENDING)])
         self.tweets.create_index([('thread_id', ASCENDING)])
-        
-        # Index for profiles
         self.profiles.create_index([('username', ASCENDING)], unique=True)
-        
-        # Add indexes for new collections
         self.comments.create_index([('tweet_id', ASCENDING)])
         self.comments.create_index([('parent_id', ASCENDING)])
         self.media.create_index([('tweet_id', ASCENDING)])
         self.quote_tweets.create_index([('tweet_id', ASCENDING)])
-    
+
     def save_tweets(self, tweets: List[Dict], username: str) -> None:
-        """Save tweets to MongoDB with proper formatting"""
         for tweet in tweets:
             tweet_doc = {
                 'tweet_id': tweet.get('id'),
-                'author': {
-                    'username': username,
-                },
+                'author': {'username': username},
                 'content': tweet.get('text', ''),
-                'timestamp': tweet.get('timestamp'),
                 'metrics': {
                     'likes': int(tweet.get('likes', 0)),
                     'retweets': int(tweet.get('retweets', 0)),
                     'replies': int(tweet.get('replies', 0))
                 },
-                'scraped_at': datetime.now(),
-                'is_thread': False,  # Will be updated when implementing thread detection
-                'media': [],  # Will be populated when implementing media scraping
-                'comments': []  # Will be populated when implementing comment scraping
+                'scraped_at': datetime.now()
             }
             
-            # Use upsert to avoid duplicates
             self.tweets.update_one(
                 {'tweet_id': tweet_doc['tweet_id']},
                 {'$set': tweet_doc},
                 upsert=True
             )
-    
+
     def get_tweets_by_username(self, username: str, limit: int = 100):
         """Retrieve tweets for a specific username"""
         return list(self.tweets.find(

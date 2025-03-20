@@ -157,23 +157,17 @@ class TwitterScraper:
             await page.close()
 
     @sleep_and_retry
-    @limits(calls=1, period=6)  # More conservative rate limit for single proxy
-    def scrape_profile(self, username: str, tweet_limit: Optional[int] = 100) -> List[Dict]:
+    @limits(calls=1, period=6)  # One request every 6 seconds
+    def scrape_profile(self, username: str, tweet_limit: Optional[int] = 10) -> List[Dict]:
         tweets = []
         
         with sync_playwright() as p:
             try:
+                proxy = self.proxy_manager.get_proxy()
                 browser = p.chromium.launch(
-                    proxy=self.proxy_manager.get_proxy(),
-                    headless=True,
-                    args=[
-                        '--disable-blink-features=AutomationControlled',
-                        '--disable-features=IsolateOrigins,site-per-process'
-                    ]
+                    proxy=proxy,
+                    headless=True
                 )
-                
-                # Increase initial delay for single proxy
-                self.random_delay(4.0, 7.0)
                 
                 context = browser.new_context(
                     viewport={"width": 1920, "height": 1080},
@@ -181,47 +175,20 @@ class TwitterScraper:
                 )
                 
                 page = context.new_page()
-                
-                # Add random delays to network requests (between 1-3 seconds)
-                page.route("**/*", lambda route: route.continue_(
-                    delay=random.randint(1000, 3000)
-                ))
-                
                 page.goto(f"https://twitter.com/{username}")
-                self.random_delay(3.0, 6.0)  # Longer initial wait
-                
-                tweets_seen = 0
-                consecutive_empty = 0
+                time.sleep(random.uniform(3, 5))
                 
                 while len(tweets) < tweet_limit:
-                    self.simulate_human_scroll(page)
-                    
-                    # Add a longer delay every 5 scrolls
-                    if tweets_seen % 5 == 0:
-                        self.random_delay(4.0, 7.0)
-                    
                     tweet_elements = page.query_selector_all('article[data-testid="tweet"]')
-                    new_tweets = tweet_elements[tweets_seen:]
                     
-                    if not new_tweets:
-                        consecutive_empty += 1
-                        if consecutive_empty >= 3:  # If no new tweets after 3 attempts, break
-                            break
-                    else:
-                        consecutive_empty = 0
-                    
-                    for tweet in new_tweets:
+                    for tweet in tweet_elements:
                         tweet_data = self.extract_tweet_data(tweet)
                         if tweet_data:
                             tweets.append(tweet_data)
-                            self.random_delay(0.5, 1.5)  # Small delay between processing tweets
-                        
-                        if len(tweets) >= tweet_limit:
-                            break
+                            if len(tweets) >= tweet_limit:
+                                break
                     
-                    tweets_seen = len(tweet_elements)
-                    
-                    if page.query_selector("div[data-testid='noMoreItems']"):
+                    if not self._scroll_down(page):
                         break
 
             except Exception as e:
@@ -231,11 +198,22 @@ class TwitterScraper:
                 if 'browser' in locals():
                     browser.close()
 
-        # Save to both JSON file and database
-        self.save_tweets(tweets, username)
         self.db_manager.save_tweets(tweets, username)
-        
         return tweets
+
+    def _get_metric(self, tweet_element, metric_type: str) -> int:
+        try:
+            metric = tweet_element.query_selector(f'[data-testid="{metric_type}"]')
+            return int(metric.inner_text() or 0)
+        except:
+            return 0
+
+    def _scroll_down(self, page) -> bool:
+        previous_height = page.evaluate('document.documentElement.scrollHeight')
+        page.evaluate('window.scrollTo(0, document.documentElement.scrollHeight)')
+        time.sleep(random.uniform(1, 2))
+        new_height = page.evaluate('document.documentElement.scrollHeight')
+        return new_height > previous_height
 
     def save_tweets(self, tweets: List[Dict], username: str) -> None:
         filename = self.output_dir / f"tweets_{username}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
