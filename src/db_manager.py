@@ -47,6 +47,10 @@ class DatabaseManager:
                     'retweets': int(tweet.get('retweets', 0)),
                     'replies': int(tweet.get('replies', 0))
                 },
+                'is_thread': tweet.get('is_thread', False),
+                'thread_tweets': tweet.get('thread_tweets', []),
+                'comments': tweet.get('comments', []),
+                'media': tweet.get('media', []),
                 'scraped_at': datetime.now()
             }
             

@@ -12,12 +12,11 @@ from .db_manager import DatabaseManager
 
 class TwitterScraper:
     def __init__(self):
-        self.proxy_manager = ProxyManager()
         self.db_manager = DatabaseManager()
+        self.proxy_manager = ProxyManager()
         self.user_agents = [
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
         ]
         self.setup_logging()
         self.output_dir = Path("data")
@@ -52,37 +51,15 @@ class TwitterScraper:
 
     def extract_tweet_data(self, tweet_element) -> Optional[Dict]:
         try:
-            # Basic tweet data
-            tweet_id = tweet_element.get_attribute('data-tweet-id')
-            content = tweet_element.query_selector('[data-testid="tweetText"]').inner_text()
-            
-            # Get metrics
-            metrics = {
+            text_element = tweet_element.query_selector('[data-testid="tweetText"]')
+            return {
+                'id': tweet_element.get_attribute('data-tweet-id'),
+                'text': text_element.inner_text() if text_element else '',
                 'likes': self._get_metric(tweet_element, 'like'),
                 'retweets': self._get_metric(tweet_element, 'retweet'),
                 'replies': self._get_metric(tweet_element, 'reply')
             }
-            
-            # Get media content
-            media = self._extract_media(tweet_element)
-            
-            # Check if part of thread
-            is_thread = bool(tweet_element.query_selector('[data-testid="conversationThread"]'))
-            
-            # Get quote tweet if exists
-            quote_tweet = self._extract_quote_tweet(tweet_element)
-            
-            return {
-                'id': tweet_id,
-                'content': content,
-                'metrics': metrics,
-                'media': media,
-                'is_thread': is_thread,
-                'quote_tweet': quote_tweet,
-                'timestamp': self._get_timestamp(tweet_element)
-            }
-        except Exception as e:
-            logging.error(f"Error extracting tweet data: {str(e)}")
+        except Exception:
             return None
 
     def _extract_media(self, tweet_element) -> List[Dict]:
@@ -105,61 +82,11 @@ class TwitterScraper:
                     })
         return media
 
-    async def scrape_thread(self, thread_id: str) -> List[Dict]:
-        """Scrape entire thread of tweets"""
-        thread_tweets = []
-        page = self.context.new_page()
-        
-        try:
-            await page.goto(f"https://twitter.com/i/web/status/{thread_id}")
-            self.random_delay(3.0, 5.0)
-            
-            while True:
-                tweets = page.query_selector_all('article[data-testid="tweet"]')
-                for tweet in tweets:
-                    tweet_data = self.extract_tweet_data(tweet)
-                    if tweet_data:
-                        thread_tweets.append(tweet_data)
-                
-                if not self.simulate_human_scroll(page):
-                    break
-                    
-            return thread_tweets
-            
-        finally:
-            await page.close()
-
-    async def scrape_comments(self, tweet_id: str, limit: int = 100) -> List[Dict]:
-        """Scrape comments/replies to a tweet"""
-        comments = []
-        page = self.context.new_page()
-        
-        try:
-            await page.goto(f"https://twitter.com/i/web/status/{tweet_id}")
-            self.random_delay(3.0, 5.0)
-            
-            while len(comments) < limit:
-                comment_elements = page.query_selector_all('article[data-testid="tweet"]')
-                for comment in comment_elements[1:]:  # Skip first tweet (original)
-                    comment_data = self.extract_tweet_data(comment)
-                    if comment_data:
-                        comments.append(comment_data)
-                        
-                if len(comments) >= limit:
-                    break
-                    
-                if not self.simulate_human_scroll(page):
-                    break
-                    
-            return comments
-            
-        finally:
-            await page.close()
-
     @sleep_and_retry
-    @limits(calls=1, period=6)  # One request every 6 seconds
+    @limits(calls=1, period=6)
     def scrape_profile(self, username: str, tweet_limit: Optional[int] = 10) -> List[Dict]:
         tweets = []
+        tweets_seen = set()
         
         with sync_playwright() as p:
             try:
@@ -175,25 +102,107 @@ class TwitterScraper:
                 )
                 
                 page = context.new_page()
-                page.goto(f"https://twitter.com/{username}")
-                time.sleep(random.uniform(3, 5))
                 
-                while len(tweets) < tweet_limit:
-                    tweet_elements = page.query_selector_all('article[data-testid="tweet"]')
+                # Go to profile page
+                page.goto(f"https://twitter.com/{username}")
+                
+                # Wait for any of these elements to appear
+                try:
+                    # Wait for either the timeline or a message indicating private account
+                    page.wait_for_selector('[data-testid="primaryColumn"], [data-testid="emptyState"]', timeout=10000)
                     
-                    for tweet in tweet_elements:
-                        tweet_data = self.extract_tweet_data(tweet)
-                        if tweet_data:
-                            tweets.append(tweet_data)
-                            if len(tweets) >= tweet_limit:
-                                break
+                    # Check if account is private
+                    private_account = page.query_selector('[data-testid="emptyState"]')
+                    if private_account:
+                        logging.warning(f"Account @{username} appears to be private")
+                        return []
                     
-                    if not self._scroll_down(page):
-                        break
+                    # Check for rate limiting or other error states
+                    error_message = page.query_selector('text="Something went wrong"')
+                    if error_message:
+                        logging.error("Twitter returned an error page")
+                        return []
+                        
+                except Exception as e:
+                    logging.error(f"Error waiting for page elements: {str(e)}")
+                    return []
+                
+                self.random_delay(3, 5)
+                
+                scroll_attempts = 0
+                max_scroll_attempts = 10
+                last_tweets_count = 0
+                
+                while len(tweets) < tweet_limit and scroll_attempts < max_scroll_attempts:
+                    try:
+                        # Get all tweets currently visible
+                        tweet_elements = page.query_selector_all('article[data-testid="tweet"]')
+                        current_tweets_count = len(tweet_elements)
+                        
+                        # If we're not getting new tweets after scrolling, increment attempts
+                        if current_tweets_count == last_tweets_count:
+                            scroll_attempts += 1
+                        else:
+                            scroll_attempts = 0
+                            last_tweets_count = current_tweets_count
+                        
+                        for tweet in tweet_elements:
+                            tweet_id = tweet.get_attribute('data-tweet-id')
+                            if not tweet_id or tweet_id in tweets_seen:
+                                continue
+                                
+                            tweets_seen.add(tweet_id)
+                            
+                            try:
+                                tweet_data = self.extract_tweet_data(tweet)
+                                if tweet_data:
+                                    # Check if it's part of a thread
+                                    thread_indicator = tweet.query_selector('[data-testid="conversationThread"]')
+                                    if thread_indicator:
+                                        thread_tweets = self.scrape_thread(tweet_id, context)
+                                        tweet_data['is_thread'] = True
+                                        tweet_data['thread_tweets'] = thread_tweets
+                                    else:
+                                        tweet_data['is_thread'] = False
+                                        tweet_data['thread_tweets'] = []
+                                    
+                                    # Get comments
+                                    tweet_data['comments'] = self.scrape_comments(tweet_id, context)
+                                    
+                                    # Get media
+                                    tweet_data['media'] = self._extract_media(tweet)
+                                    
+                                    tweets.append(tweet_data)
+                                    logging.info(f"Scraped tweet {len(tweets)}/{tweet_limit}")
+                                    
+                                    if len(tweets) >= tweet_limit:
+                                        break
+                            except Exception as e:
+                                logging.error(f"Error processing tweet {tweet_id}: {str(e)}")
+                                continue
+                        
+                        if len(tweets) < tweet_limit:
+                            # Scroll and wait for new content
+                            if self._scroll_down(page):
+                                page.wait_for_timeout(2000)  # Wait for new tweets to load
+                            else:
+                                scroll_attempts += 1
+                                
+                            # Try to click "Show more tweets" if present
+                            try:
+                                show_more = page.query_selector('span:has-text("Show more")')
+                                if show_more:
+                                    show_more.click()
+                                    self.random_delay(2, 3)
+                            except:
+                                pass
+                                
+                    except Exception as e:
+                        logging.error(f"Error during tweet collection: {str(e)}")
+                        scroll_attempts += 1
 
             except Exception as e:
-                logging.error(f"Error scraping profile {username}: {str(e)}")
-                raise
+                logging.error(f"Error during profile scrape: {str(e)}")
             finally:
                 if 'browser' in locals():
                     browser.close()
@@ -201,19 +210,105 @@ class TwitterScraper:
         self.db_manager.save_tweets(tweets, username)
         return tweets
 
+    def scrape_thread(self, tweet_id: str, context) -> List[Dict]:
+        """Scrape entire thread of tweets"""
+        thread_tweets = []
+        page = context.new_page()
+        
+        try:
+            page.goto(f"https://twitter.com/i/web/status/{tweet_id}")
+            self.random_delay(3.0, 5.0)
+            
+            while True:
+                tweets = page.query_selector_all('article[data-testid="tweet"]')
+                for tweet in tweets:
+                    tweet_data = self.extract_tweet_data(tweet)
+                    if tweet_data:
+                        thread_tweets.append(tweet_data)
+                
+                if not self._scroll_down(page):
+                    break
+                    
+            return thread_tweets
+            
+        finally:
+            page.close()
+
+    def scrape_comments(self, tweet_id: str, context, limit: int = 5) -> List[Dict]:
+        """Scrape comments/replies to a tweet"""
+        comments = []
+        page = context.new_page()
+        
+        try:
+            page.goto(f"https://twitter.com/i/web/status/{tweet_id}")
+            self.random_delay(3.0, 5.0)
+            
+            while len(comments) < limit:
+                comment_elements = page.query_selector_all('article[data-testid="tweet"]')
+                for comment in comment_elements[1:]:  # Skip first tweet (original)
+                    comment_data = self.extract_tweet_data(comment)
+                    if comment_data:
+                        comment_data['media'] = self._extract_media(comment)
+                        comments.append(comment_data)
+                        
+                if len(comments) >= limit:
+                    break
+                    
+                if not self._scroll_down(page):
+                    break
+                    
+            return comments
+            
+        finally:
+            page.close()
+
     def _get_metric(self, tweet_element, metric_type: str) -> int:
         try:
-            metric = tweet_element.query_selector(f'[data-testid="{metric_type}"]')
-            return int(metric.inner_text() or 0)
-        except:
+            # First try to find the group element
+            group = tweet_element.query_selector(f'[data-testid="{metric_type}"]')
+            if not group:
+                return 0
+                
+            # Look for the actual number within the group
+            metric_text = group.query_selector('[data-testid="app-text-transition-container"]')
+            if not metric_text:
+                return 0
+                
+            text = metric_text.inner_text().strip()
+            if not text:
+                return 0
+                
+            # Handle K/M suffixes
+            if 'K' in text:
+                return int(float(text.replace('K', '')) * 1000)
+            elif 'M' in text:
+                return int(float(text.replace('M', '')) * 1000000)
+            return int(text) if text.isdigit() else 0
+        except Exception as e:
+            logging.error(f"Error getting metric {metric_type}: {str(e)}")
             return 0
 
     def _scroll_down(self, page) -> bool:
-        previous_height = page.evaluate('document.documentElement.scrollHeight')
-        page.evaluate('window.scrollTo(0, document.documentElement.scrollHeight)')
-        time.sleep(random.uniform(1, 2))
-        new_height = page.evaluate('document.documentElement.scrollHeight')
-        return new_height > previous_height
+        """Scroll down and wait for new content to load"""
+        try:
+            previous_height = page.evaluate('document.documentElement.scrollHeight')
+            page.evaluate('window.scrollTo(0, document.documentElement.scrollHeight)')
+            self.random_delay(2, 3)  # Wait longer for content to load
+            
+            # Wait for possible dynamic content loading
+            page.wait_for_timeout(1000)  # Additional 1 second wait
+            
+            # Try to find the "Show more tweets" button and click it if present
+            show_more = page.query_selector('span:has-text("Show more tweets")')
+            if show_more:
+                show_more.click()
+                self.random_delay(2, 3)
+            
+            new_height = page.evaluate('document.documentElement.scrollHeight')
+            return new_height > previous_height
+        except Exception as e:
+            logging.error(f"Error during scroll: {str(e)}")
+            return False
 
     def save_tweets(self, tweets: List[Dict], username: str) -> None:
         filename = self.output_dir / f"tweets_{username}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
