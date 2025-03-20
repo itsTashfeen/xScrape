@@ -1,0 +1,14 @@
+[
+    {
+        "host": "brd.superproxy.com",
+        "port": "22225",
+        "username": "your-username-1",
+        "password": "your-password-1"
+    },
+    {
+        "host": "brd.superproxy.com",
+        "port": "22225",
+        "username": "your-username-2",
+        "password": "your-password-2"
+    }
+] 
